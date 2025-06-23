@@ -280,6 +280,18 @@ rabbit_opts = [
                 'with non-destructive consumer semantics. It is available '
                 'as of RabbitMQ 3.9.0. If set this option will replace all '
                 'fanout queues with only one stream queue.'),
+    cfg.IntOpt('rabbit_stream_max_segment_size_bytes',
+               default=500000000,
+               help='Positive interger representing the maximum size of '
+               'stream queue segments. This option is only applied when '
+               'rabbitmq_stream_fanout is set to True. Messages in stream '
+               'queues will be saved in segment files in a disk. Once the '
+               'segment reaches the maximum size, it will be targetted to '
+               'be removed by retention policy (Such as '
+               'rabbit_transient_queues_ttl), then new segment will be '
+               'allocated for new messages.'
+               'Default value from RabbitMQ is 500000000 (500 MB)'
+               )
 ]
 
 LOG = logging.getLogger(__name__)
@@ -288,7 +300,8 @@ LOG = logging.getLogger(__name__)
 def _get_queue_arguments(rabbit_ha_queues, rabbit_queue_ttl,
                          rabbit_quorum_queue,
                          rabbit_quorum_queue_config,
-                         rabbit_stream_fanout):
+                         rabbit_stream_fanout,
+                         rabbit_stream_max_segment_size_bytes):
     """Construct the arguments for declaring a queue.
 
     If the rabbit_ha_queues option is set, we try to declare a mirrored queue
@@ -361,7 +374,11 @@ def _get_queue_arguments(rabbit_ha_queues, rabbit_queue_ttl,
         args['x-expires'] = rabbit_queue_ttl * 1000
 
     if rabbit_stream_fanout:
-        args = {'x-queue-type': 'stream'}
+        args = {
+            'x-queue-type': 'stream',
+            'x-stream-max-segment-size-bytes':
+                rabbit_stream_max_segment_size_bytes
+        }
         if rabbit_queue_ttl > 0:
             # max-age is a string
             args['x-max-age'] = f"{rabbit_queue_ttl}s"
@@ -393,7 +410,8 @@ class Consumer:
                  nowait=False, rabbit_ha_queues=None, rabbit_queue_ttl=0,
                  enable_cancel_on_failover=False, rabbit_quorum_queue=False,
                  rabbit_quorum_queue_config=QuorumMemConfig(0, 0, 0),
-                 rabbit_stream_fanout=False):
+                 rabbit_stream_fanout=False,
+                 rabbit_stream_max_segment_size_bytes=500000000):
         """Init the Consumer class with the exchange_name, routing_key,
         type, durable auto_delete
         """
@@ -409,7 +427,8 @@ class Consumer:
         rabbit_quorum_queue_config = rabbit_quorum_queue_config or {}
         self.queue_arguments = _get_queue_arguments(
             rabbit_ha_queues, rabbit_queue_ttl, rabbit_quorum_queue,
-            rabbit_quorum_queue_config, rabbit_stream_fanout)
+            rabbit_quorum_queue_config, rabbit_stream_fanout,
+            rabbit_stream_max_segment_size_bytes)
         self.queue = None
         self._declared_on = None
         self.exchange = kombu.entity.Exchange(
@@ -419,6 +438,8 @@ class Consumer:
             auto_delete=self.exchange_auto_delete)
         self.enable_cancel_on_failover = enable_cancel_on_failover
         self.rabbit_stream_fanout = rabbit_stream_fanout
+        self.rabbit_stream_max_segment_size_bytes = \
+            rabbit_stream_max_segment_size_bytes
         self.next_stream_offset = "last"
 
     def _declare_fallback(self, err, conn, consumer_arguments):
@@ -471,7 +492,10 @@ class Consumer:
 
         if self.rabbit_stream_fanout:
             consumer_arguments = {
-                "x-stream-offset": self.next_stream_offset}
+                "x-stream-offset": self.next_stream_offset,
+                "x-stream-max-segment-size-bytes":
+                    self.rabbit_stream_max_segment_size_bytes
+            }
 
         self.queue = kombu.entity.Queue(
             name=self.queue_name,
@@ -486,9 +510,11 @@ class Consumer:
 
         try:
             if self.rabbit_stream_fanout:
-                LOG.info('[%s] Stream Queue.declare: %s after offset %s',
+                LOG.info('[%s] Stream Queue.declare: %s after offset %s, '
+                         'max segment size: %s',
                          conn.connection_id, self.queue_name,
-                         self.next_stream_offset)
+                         self.next_stream_offset,
+                         self.rabbit_stream_max_segment_size_bytes)
             else:
                 LOG.debug('[%s] Queue.declare: %s',
                           conn.connection_id, self.queue_name)
@@ -748,6 +774,8 @@ class Connection:
         self.rabbit_transient_quorum_queue = \
             driver_conf.rabbit_transient_quorum_queue
         self.rabbit_stream_fanout = driver_conf.rabbit_stream_fanout
+        self.rabbit_stream_max_segment_size_bytes = \
+            driver_conf.rabbit_stream_max_segment_size_bytes
         self.rabbit_transient_queues_ttl = \
             driver_conf.rabbit_transient_queues_ttl
         self.rabbit_qos_prefetch_count = driver_conf.rabbit_qos_prefetch_count
@@ -778,6 +806,11 @@ class Connection:
             raise RuntimeError('Configuration Error: rabbit_stream_fanout '
                                'need rabbit_transient_quorum_queue to be set '
                                'to true.')
+
+        if (self.rabbit_stream_max_segment_size_bytes <= 0):
+            raise RuntimeError('Configuration Error: '
+                               'rabbit_stream_max_segment_size_bytes '
+                               'needs to be set to a value greater than 0.')
 
         if self.heartbeat_in_pthread:
             # NOTE(hberaud): Experimental: threading module is in use to run
@@ -1556,7 +1589,11 @@ class Connection:
             enable_cancel_on_failover=self.enable_cancel_on_failover,
             rabbit_quorum_queue=self.rabbit_transient_quorum_queue,
             rabbit_quorum_queue_config=self.rabbit_quorum_queue_config,
-            rabbit_stream_fanout=self.rabbit_stream_fanout)
+            rabbit_stream_fanout=self.rabbit_stream_fanout,
+            rabbit_stream_max_segment_size_bytes=(
+                self.rabbit_stream_max_segment_size_bytes
+            )
+        )
 
         self.declare_consumer(consumer)
 
@@ -1664,7 +1701,8 @@ class Connection:
                     0,
                     self.rabbit_quorum_queue,
                     self.rabbit_quorum_queue_config,
-                    False))
+                    False,
+                    self.rabbit_stream_max_segment_size_bytes))
             log_info = {'key': routing_key, 'exchange': exchange}
             LOG.trace(
                 'Connection._publish_and_creates_default_queue: '
